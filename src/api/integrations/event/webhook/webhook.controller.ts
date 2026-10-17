@@ -10,6 +10,21 @@ import * as jwt from 'jsonwebtoken';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
 
+const CONFIG_READ_DELAYS_MS = [100, 200, 400] as const;
+const TRANSIENT_CONFIG_READ_CODES = new Set(['P1001', 'P1002', 'P1017', 'P2024']);
+
+class WebhookConfigReadError extends Error {
+  readonly code = 'WEBHOOK_CONFIG_READ_FAILED';
+
+  constructor(
+    readonly databaseCode: string,
+    readonly attempts: number,
+  ) {
+    super('Webhook configuration read failed before HTTP delivery.');
+    this.name = 'WebhookConfigReadError';
+  }
+}
+
 export class WebhookController extends EventController implements EventControllerInterface {
   private readonly logger = new Logger('WebhookController');
 
@@ -71,7 +86,7 @@ export class WebhookController extends EventController implements EventControlle
       return;
     }
 
-    const instance = (await this.get(instanceName)) as wa.LocalWebHook;
+    const instance = await this.readConfigForEmission(instanceName);
 
     const webhookConfig = configService.get<Webhook>('WEBHOOK');
     const webhookLocal = instance?.events;
@@ -198,6 +213,44 @@ export class WebhookController extends EventController implements EventControlle
         }
       }
     }
+  }
+
+  private async readConfigForEmission(instanceName: string): Promise<wa.LocalWebHook> {
+    const maxAttempts = CONFIG_READ_DELAYS_MS.length + 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return (await this.get(instanceName)) as wa.LocalWebHook;
+      } catch (error) {
+        // Initialization errors expose errorCode; request errors expose code.
+        // Never copy raw messages, metadata, causes or payload into logs/errors.
+        const rawCode = typeof error?.code === 'string' ? error.code : error?.errorCode;
+        const databaseCode = typeof rawCode === 'string' && /^P\d{4}$/.test(rawCode) ? rawCode : 'UNKNOWN';
+        const transient = TRANSIENT_CONFIG_READ_CODES.has(databaseCode);
+
+        if (!transient || attempt === maxAttempts) {
+          this.logger.error({
+            local: 'WebhookController.readConfigForEmission',
+            event: 'webhook_config_read_failed',
+            databaseCode,
+            attempt,
+          });
+          throw new WebhookConfigReadError(databaseCode, attempt);
+        }
+
+        const delayMs = CONFIG_READ_DELAYS_MS[attempt - 1];
+        this.logger.warn({
+          local: 'WebhookController.readConfigForEmission',
+          event: 'webhook_config_read_retry',
+          databaseCode,
+          attempt,
+          delayMs,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    throw new WebhookConfigReadError('UNKNOWN', maxAttempts);
   }
 
   private async retryWebhookRequest(
